@@ -1,0 +1,456 @@
+-- Services
+-- Get references to various Roblox services that the script will use.
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
+local SoundService = game:GetService("SoundService")
+
+-- Player and Camera
+-- Get the local player and the current workspace camera.
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+if not camera then
+	-- Wait for the camera to be available, as it might not exist when the script first runs.
+	camera = workspace.Camera
+end
+
+-- Configuration
+-- This section holds all the customizable settings for the freecam effect.
+local TOGGLE_KEY = Enum.KeyCode.K -- The key used to turn the freecam on and off.
+local MOVE_SPEED = 50 -- How fast the camera moves forward (studs per second).
+local ROTATION_SPEED = 0.4 -- How sensitive the camera rotation is to mouse movement.
+local FREE_CAM_FOV = 120 -- The Field of View when in freecam mode.
+local TRANSITION_DURATION = 0.5 -- How long the transition in and out of freecam takes.
+local TWEEN_INFO = TweenInfo.new(TRANSITION_DURATION, Enum.EasingStyle.Quad, Enum.EasingDirection.Out) -- Tween settings for transitions.
+local FREE_CAM_DURATION = 5 -- The free cam will last for this many seconds before automatically turning off.
+local PITCH_LIMIT = math.rad(89) -- The maximum angle the camera can look up or down.
+local AUTO_LEVEL_INTERVAL = 0.75 -- How often the script checks if it should auto-level the camera.
+local AUTO_LEVEL_DURATION = 0.4 -- How long the auto-leveling animation takes.
+local AUTO_LEVEL_TWEEN_INFO = TweenInfo.new(AUTO_LEVEL_DURATION, Enum.EasingStyle.Sine, Enum.EasingDirection.Out) -- Tween settings for auto-leveling.
+local AMBIENT_DRIFT_SPEED = 0.08 -- How fast the camera wanders subtly. Lower is slower.
+local AMBIENT_DRIFT_MAGNITUDE_DEG = 1.2 -- The maximum angle in degrees the camera will drift.
+local DOF_FAR_INTENSITY = 0.8 -- How blurry objects far away are.
+local DOF_NEAR_INTENSITY = 0.8 -- How blurry objects close up are.
+local DOF_INFOCUS_RADIUS = 10 -- The size of the sharp, in-focus area.
+local RAYCAST_DISTANCE = 500 -- How far the camera raycasts to determine the focus point for Depth of Field.
+local WIND_SOUND_ID = "rbxassetid://3308152153" -- The asset ID for the wind sound effect.
+local WIND_SOUND_VOLUME = 0.7 -- The maximum volume for the wind sound.
+local SPEEDLINES_OFFSET_DISTANCE = 20 -- How far in front of the camera the speedlines effect appears.
+local MAX_SPEED_FOR_MAX_VOLUME = 150 -- The camera speed (studs/sec) at which the wind sound reaches its maximum volume.
+local SOUND_VOLUME_SMOOTHING_FACTOR = 0.1 -- How quickly the sound volume adjusts to speed changes. Lower is smoother.
+
+-- State Variables
+-- These variables track the current state of the freecam mode.
+local isFreeCamActive = false -- Is the freecam currently on?
+local originalFov = camera.FieldOfView -- Stores the camera's original Field of View.
+local originalCameraType = camera.CameraType -- Stores the camera's original type (e.g., Custom).
+local originalMouseBehavior = UserInputService.MouseBehavior -- Stores the original mouse behavior.
+local renderSteppedConnection: RBXScriptConnection | nil = nil -- The connection to the RenderStepped event for camera updates.
+local originalTransparencies: {[Instance]: number} = {} -- A table to store the original transparencies of the character's parts.
+local freeCamTimer: thread | nil = nil -- The timer thread that automatically disables freecam.
+local freeCamYaw: number = 0 -- The horizontal rotation of the camera.
+local freeCamPitch: number = 0 -- The vertical rotation of the camera.
+local autoLevelThread: thread | nil = nil -- The thread for the auto-leveling function.
+local autoLevelTween: Tween | nil = nil -- The tween used for the auto-level animation.
+local speedLinesPart: BasePart | nil = nil -- A reference to the speedlines part in the workspace.
+local raycastParams = RaycastParams.new() -- Reusable raycast parameters object.
+local lastCameraPosition: Vector3 | nil = nil -- The camera's position from the previous frame, used for calculating speed.
+
+-- Visual Effects
+-- Create the visual effect instances once when the script starts to avoid creating them repeatedly.
+local depthOfFieldEffect = Instance.new("DepthOfFieldEffect")
+depthOfFieldEffect.Name = "FreeCamDepthOfField"
+depthOfFieldEffect.FarIntensity = 0
+depthOfFieldEffect.NearIntensity = 0
+depthOfFieldEffect.InFocusRadius = DOF_INFOCUS_RADIUS
+depthOfFieldEffect.Enabled = false
+depthOfFieldEffect.Parent = Lighting
+
+local colorCorrection = Instance.new("ColorCorrectionEffect")
+colorCorrection.Name = "FreeCamColorCorrection"
+colorCorrection.Saturation = 0
+colorCorrection.Brightness = 0
+colorCorrection.Contrast = 0
+colorCorrection.Enabled = false
+colorCorrection.Parent = Lighting
+
+-- Sound Effect
+-- Create the sound instance once.
+local windSound = Instance.new("Sound")
+windSound.Name = "FreeCamWindSound"
+windSound.SoundId = WIND_SOUND_ID
+windSound.Looped = true
+windSound.Volume = 0
+windSound.Parent = SoundService
+
+-- Forward declare enable/disable functions for the toggle function
+-- This is necessary so the toggle function can call them before they are fully defined.
+local enableFreeCam
+local disableFreeCam
+local autoLevelCamera
+
+-- Function to handle camera movement and rotation every frame
+local function updateCamera(dt: number)
+	if not isFreeCamActive then return end
+
+	-- Get mouse movement since the last frame to rotate the camera.
+	local mouseDelta = UserInputService:GetMouseDelta()
+
+	-- If the player moves the mouse vertically, cancel any ongoing auto-level tween.
+	if math.abs(mouseDelta.Y) > 0.1 and autoLevelTween then
+		autoLevelTween:Cancel()
+		autoLevelTween = nil
+	end
+
+	-- Update the camera's yaw (horizontal) and pitch (vertical) angles based on mouse movement.
+	freeCamYaw -= math.rad(mouseDelta.X * ROTATION_SPEED)
+	freeCamPitch -= math.rad(mouseDelta.Y * ROTATION_SPEED)
+
+	-- Add a subtle, random "drift" to the camera's rotation for a more natural feel.
+	local currentTime = time()
+	local driftMagnitudeRad = math.rad(AMBIENT_DRIFT_MAGNITUDE_DEG)
+	local yawDriftOffset = math.noise(currentTime * AMBIENT_DRIFT_SPEED, 100) * driftMagnitudeRad
+	local pitchDriftOffset = math.noise(200, currentTime * AMBIENT_DRIFT_SPEED) * driftMagnitudeRad
+
+	-- Combine the player-controlled rotation with the ambient drift and clamp the pitch.
+	local finalYaw = freeCamYaw + yawDriftOffset
+	local finalPitch = math.clamp(freeCamPitch + pitchDriftOffset, -PITCH_LIMIT, PITCH_LIMIT)
+
+	-- Construct the final CFrame rotations.
+	local fullRotation = CFrame.fromEulerAnglesYXZ(finalPitch, finalYaw, 0)
+	local horizontalRotation = CFrame.fromEulerAnglesYXZ(0, finalYaw, 0)
+
+	-- Apply the final rotation to the camera.
+	camera.CFrame = CFrame.new(camera.CFrame.Position) * fullRotation
+
+	-- Move the camera forward based on its horizontal direction (ignoring pitch).
+	local forwardVector = horizontalRotation.LookVector
+	camera.CFrame += forwardVector * MOVE_SPEED * dt
+
+	-- If a speedlines part exists, position it a set distance in front of the camera.
+	if speedLinesPart then
+		speedLinesPart.CFrame = camera.CFrame * CFrame.new(0, 0, -SPEEDLINES_OFFSET_DISTANCE)
+	end
+
+	-- Raycast forward to find where the camera is looking and set the Depth of Field focus distance.
+	local rayOrigin = camera.CFrame.Position
+	local rayDirection = camera.CFrame.LookVector * RAYCAST_DISTANCE
+	local result = workspace:Raycast(rayOrigin, rayDirection, raycastParams)
+	if result then
+		depthOfFieldEffect.FocusDistance = result.Distance
+	else
+		depthOfFieldEffect.FocusDistance = RAYCAST_DISTANCE
+	end
+	
+	-- Calculate the camera's speed and adjust the wind sound volume accordingly.
+	if lastCameraPosition then
+		local displacement = camera.CFrame.Position - lastCameraPosition
+		local speed = if dt > 0 then displacement.Magnitude / dt else 0
+		
+		-- Map the speed to a volume level between 0 and the max volume.
+		local volumeRatio = math.clamp(speed / MAX_SPEED_FOR_MAX_VOLUME, 0, 1)
+		local targetVolume = volumeRatio * WIND_SOUND_VOLUME
+		
+		-- Smoothly interpolate the current volume towards the target volume.
+		windSound.Volume = windSound.Volume + (targetVolume - windSound.Volume) * SOUND_VOLUME_SMOOTHING_FACTOR
+	end
+	lastCameraPosition = camera.CFrame.Position
+end
+
+
+
+-- This function runs in a separate thread to handle auto-leveling the camera
+autoLevelCamera = function()
+	while isFreeCamActive do
+		task.wait(AUTO_LEVEL_INTERVAL)
+		if not isFreeCamActive then break end
+
+		-- Check if auto-leveling is already happening or if the camera is already level.
+		if (autoLevelTween and autoLevelTween.PlaybackState == Enum.PlaybackState.Playing) or math.abs(freeCamPitch) < math.rad(1) then
+			continue
+		end
+
+		-- Use a proxy NumberValue to tween the pitch angle smoothly back to 0.
+		local pitchProxy = Instance.new("NumberValue")
+		pitchProxy.Value = freeCamPitch
+
+		local connection: RBXScriptConnection
+		connection = pitchProxy.Changed:Connect(function(newPitch)
+			freeCamPitch = newPitch
+		end)
+
+		autoLevelTween = TweenService:Create(pitchProxy, AUTO_LEVEL_TWEEN_INFO, {Value = 0})
+		
+		-- Clean up the proxy and connection once the tween is finished.
+		autoLevelTween.Completed:Once(function()
+			connection:Disconnect()
+			pitchProxy:Destroy()
+			autoLevelTween = nil
+		end)
+
+		autoLevelTween:Play()
+	end
+end
+
+
+-- Function to disable free camera mode
+disableFreeCam = function()
+	if not isFreeCamActive then return end
+	
+	-- Cancel the automatic turn-off timer if it's running.
+	if freeCamTimer then
+		task.cancel(freeCamTimer)
+		freeCamTimer = nil
+	end
+
+	-- Reset state variables.
+	isFreeCamActive = false
+	speedLinesPart = nil
+	lastCameraPosition = nil
+	
+	-- Find and disable the speedlines particle emitter.
+	local speedLinesVFX = workspace:FindFirstChild("Speedlines")
+	if speedLinesVFX then
+		local effectToDisable = speedLinesVFX:FindFirstChildOfClass("ParticleEmitter")
+		if not effectToDisable then
+			local attachment = speedLinesVFX:FindFirstChildOfClass("Attachment")
+			if attachment then
+				effectToDisable = attachment:FindFirstChildOfClass("ParticleEmitter")
+			end
+		end
+		if effectToDisable then
+			effectToDisable.Enabled = false
+		end
+	end
+	
+	-- Clean up running threads and connections to prevent memory leaks.
+	if autoLevelThread then
+		task.cancel(autoLevelThread)
+		autoLevelThread = nil
+	end
+	
+	if autoLevelTween then
+		autoLevelTween:Cancel()
+		autoLevelTween = nil
+	end
+
+	if renderSteppedConnection then
+		renderSteppedConnection:Disconnect()
+		renderSteppedConnection = nil
+	end
+	
+	-- Safely teleport the player to the ground below the camera's final position.
+	local character = player.Character
+	if character then
+		local rootPart = character:FindFirstChild("HumanoidRootPart")
+		if rootPart and rootPart:IsA("BasePart") then
+			local rayOrigin = camera.CFrame.Position
+			local rayDirection = Vector3.new(0, -1000, 0)
+
+			local groundRaycastParams = RaycastParams.new()
+			groundRaycastParams.FilterType = Enum.RaycastFilterType.Exclude
+			groundRaycastParams.FilterDescendantsInstances = {character}
+			groundRaycastParams.IgnoreWater = true
+
+			local result = workspace:Raycast(rayOrigin, rayDirection, groundRaycastParams)
+
+			local targetPosition: Vector3
+			if result and result.Position then
+				-- If ground is found, place the player slightly above it.
+				targetPosition = result.Position + Vector3.new(0, 3, 0)
+			else
+				-- If no ground, place the player where the camera was.
+				targetPosition = camera.CFrame.Position
+			end
+
+			-- Make the character face the same horizontal direction as the camera.
+			local lookVector = camera.CFrame.LookVector
+			local flatLookVector = Vector3.new(lookVector.X, 0, lookVector.Z).Unit
+			rootPart.CFrame = CFrame.lookAt(targetPosition, targetPosition + flatLookVector)
+		end
+	end
+	
+	-- Restore the original camera and mouse settings.
+	camera.CameraType = originalCameraType
+	UserInputService.MouseBehavior = originalMouseBehavior
+	
+	-- Tween all visual and audio effects back to their normal states.
+	TweenService:Create(camera, TWEEN_INFO, { FieldOfView = originalFov }):Play()
+	TweenService:Create(colorCorrection, TWEEN_INFO, { Saturation = 0, Brightness = 0, Contrast = 0 }):Play()
+	
+	-- Fade out the wind sound and stop it when done.
+	local windSoundTween = TweenService:Create(windSound, TWEEN_INFO, { Volume = 0 })
+	windSoundTween.Completed:Once(function()
+		if not isFreeCamActive then
+			windSound:Stop()
+		end
+	end)
+	windSoundTween:Play()
+	
+	-- Fade out the Depth of Field and disable the effects when the tween is complete.
+	local dofTween = TweenService:Create(depthOfFieldEffect, TWEEN_INFO, { FarIntensity = 0, NearIntensity = 0 })
+	dofTween.Completed:Once(function()
+		if not isFreeCamActive then
+			depthOfFieldEffect.Enabled = false
+			colorCorrection.Enabled = false
+		end
+	end)
+	dofTween:Play()
+	
+	-- Restore the character's original appearance and re-enable movement.
+	if character then
+		for item, transparency in pairs(originalTransparencies) do
+			if item and item.Parent then
+				item.Transparency = transparency
+			end
+		end
+		
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			humanoid.PlatformStand = false
+		end
+	end
+	originalTransparencies = {}
+	
+	-- Re-enable all ScreenGuis.
+	local playerGui = player:FindFirstChildOfClass("PlayerGui")
+	if playerGui then
+		for _, gui in ipairs(playerGui:GetChildren()) do
+			if gui:IsA("ScreenGui") then
+				gui.Enabled = true
+			end
+		end
+	end
+end
+
+-- Function to enable free camera mode
+enableFreeCam = function()
+	if isFreeCamActive then return end
+	isFreeCamActive = true
+	
+	-- Determine the starting CFrame for the camera, defaulting to the player's head.
+	local character = player.Character
+	local startCFrame = camera.CFrame
+	if character then
+		local head = character:FindFirstChild("Head")
+		if head then
+			startCFrame = head.CFrame
+		end
+	end
+	
+	-- Set up raycast parameters to ignore the player's character and the speedlines part.
+	local filterList = {}
+	if character then
+		table.insert(filterList, character)
+	end
+	
+	local speedLinesVFX = workspace:FindFirstChild("Speedlines")
+	if speedLinesVFX then
+		if speedLinesVFX:IsA("BasePart") then
+			speedLinesPart = speedLinesVFX
+			table.insert(filterList, speedLinesVFX)
+		end
+		-- Find and enable the speedlines particle emitter.
+		local effectToEnable = speedLinesVFX:FindFirstChildOfClass("ParticleEmitter")
+		if not effectToEnable then
+			local attachment = speedLinesVFX:FindFirstChildOfClass("Attachment")
+			if attachment then
+				effectToEnable = attachment:FindFirstChildOfClass("ParticleEmitter")
+			end
+		end
+		if effectToEnable then
+			effectToEnable.Enabled = true
+		end
+	end
+	raycastParams.FilterDescendantsInstances = filterList
+	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+	
+	-- Save the original camera and mouse settings so they can be restored later.
+	originalFov = camera.FieldOfView
+	originalCameraType = camera.CameraType
+	originalMouseBehavior = UserInputService.MouseBehavior
+	
+	-- Set the initial rotation of the freecam to match the target start CFrame.
+	local lookVector = startCFrame.LookVector
+	freeCamYaw = math.atan2(lookVector.X, -lookVector.Z)
+	freeCamPitch = math.asin(-lookVector.Y)
+	
+	-- Make the player's character invisible and disable their movement.
+	if character then
+		originalTransparencies = {}
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			humanoid.PlatformStand = true
+		end
+		for _, descendant in ipairs(character:GetDescendants()) do
+			if descendant:IsA("BasePart") or descendant:IsA("Decal") then
+				originalTransparencies[descendant] = descendant.Transparency
+				descendant.Transparency = 1
+			end
+		end
+	end
+	
+	-- Disable all ScreenGuis to hide the UI.
+	local playerGui = player:FindFirstChildOfClass("PlayerGui")
+	if playerGui then
+		for _, gui in ipairs(playerGui:GetChildren()) do
+			if gui:IsA("ScreenGui") then
+				gui.Enabled = false
+			end
+		end
+	end
+
+	-- Set the camera to be script-controlled and lock the mouse to the center of the screen.
+	camera.CameraType = Enum.CameraType.Scriptable
+	UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
+	
+	-- Enable the visual effects.
+	depthOfFieldEffect.Enabled = true
+	colorCorrection.Enabled = true
+
+	-- Start the wind sound playing (volume will be controlled by the update loop).
+	if not windSound.IsPlaying then
+		windSound:Play()
+	end
+	lastCameraPosition = camera.CFrame.Position
+	
+	-- Start all the tweens to transition into freecam mode.
+	TweenService:Create(camera, TWEEN_INFO, { CFrame = startCFrame }):Play()
+	TweenService:Create(camera, TWEEN_INFO, { FieldOfView = FREE_CAM_FOV }):Play()
+	TweenService:Create(depthOfFieldEffect, TWEEN_INFO, { FarIntensity = DOF_FAR_INTENSITY, NearIntensity = DOF_NEAR_INTENSITY }):Play()
+	TweenService:Create(colorCorrection, TWEEN_INFO, { Saturation = -0.6, Brightness = 0.1, Contrast = -0.15 }):Play()
+	
+	-- Connect the main update loop to the RenderStepped event.
+	renderSteppedConnection = RunService.RenderStepped:Connect(updateCamera)
+	-- Start the auto-leveling thread.
+	autoLevelThread = task.spawn(autoLevelCamera)
+	
+	-- Start a timer to automatically disable freecam after a set duration.
+	freeCamTimer = task.delay(FREE_CAM_DURATION, function()
+		if isFreeCamActive then
+			freeCamTimer = nil
+			disableFreeCam()
+		end
+	end)
+end
+
+
+-- function to toggle the free camera mode
+local function toggleFreeCam()
+	if isFreeCamActive then
+		disableFreeCam()
+	else
+		enableFreeCam()
+	end
+end
+
+-- making function work when toggle key is pressed
+UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
+	if gameProcessedEvent then return end
+	
+	if input.KeyCode == TOGGLE_KEY then
+		toggleFreeCam()
+	end
+end)
